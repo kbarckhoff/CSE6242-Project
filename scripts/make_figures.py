@@ -17,13 +17,10 @@ def plot_zip_counts_by_state(by_state_csv: Path, out_png: Path) -> None:
     )
     ax.set_xlabel("State")
     ax.set_ylabel("# ZIPs in sample")
-
-    # 🔹 remove the top border line
     ax.spines["top"].set_visible(False)
-    # (optional: also remove right border for a cleaner look)
     # ax.spines["right"].set_visible(False)
 
-    # headroom + labels (keep from earlier)
+    # headroom + labels 
     ymax = float(df["n_zips"].max())
     ax.set_ylim(0, ymax * 1.20)
     for p in ax.patches:
