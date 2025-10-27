@@ -19,7 +19,7 @@ def main(args):
     print(f"Reading: {csvs[0]}")
     df = pd.read_csv(csvs[0], low_memory=False)
 
-    # Small, deterministic sample so reviews are fast & reproducible
+    # Small, deterministic sample of n rows from the big zillow data [to run locally and check for trends]
     n = min(len(df), args.nrows)
     sample = df.sample(n=n, random_state=42)
 
