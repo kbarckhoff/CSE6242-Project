@@ -36,12 +36,12 @@ def melt_zori_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
 
     Steps
     -----
-    - Keep identifier columns (RegionID, SizeRank, RegionName, RegionType, StateName,
+    - Keep original columns (RegionID, SizeRank, RegionName, RegionType, StateName,
       State, City, Metro, CountyName).
     - Treat all remaining date-like columns (e.g., 'YYYY-MM-31') as values.
     - Melt to columns: id vars + ['date', 'zori'].
     - Coerce `date` to datetime and `zori` to numeric (invalids -> NaN).
-    - Sort rows by state, zip, date for stable downstream processing.
+    - Sort rows by state, zip, date for post-processing
 
     Returns
     -------
@@ -141,14 +141,13 @@ def basic_eda_summaries(df_long: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 def main(args) -> None:
     """
-    End-to-end ingest pipeline:
 
     1) Locate the raw Zillow CSV in `data/raw/` (or `--input_dir`) using common
        filename patterns.
-    2) Read the CSV, convert to tidy long format using `melt_zori_wide_to_long` function.
-    3) Produce a small, commit-safe sample using `small_subset_for_commit` function and write:
+    2) Read the CSV, converts date columns to date rows, date is changed from string to datetime, zori to numeric
+    3) Outputs a small, commit-safe sample using `small_subset_for_commit` function and write:
          - `data/samples/zori_long_small.csv` (CSV)
-         - `data/processed/zori_long_small.parquet` (Parquet for fast local use)
+         - `data/processed/zori_long_small.parquet`
     4) Generate tiny EDA tables using `basic_eda_summaries` function and write them under
        `data/samples/` for quick review in PRs.
 
@@ -189,7 +188,7 @@ def main(args) -> None:
     small.to_csv(out_small, index=False)
     print(f"Wrote small tidy sample -> {out_small.resolve()}  (rows={len(small):,})")
 
-    # Save small processed Parquet too (fast for later notebooks)
+    # Save small processed Parquet too
     processed_dir = data_dir / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
     (processed_dir / "zori_long_small.parquet").write_bytes(small.to_parquet(index=False))
