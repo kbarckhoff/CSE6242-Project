@@ -75,6 +75,8 @@ def melt_zori_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
     long = long[long["zip"].astype(str).str.fullmatch(r"\d{5}", na=False)]
     return long
 
+
+
 def small_subset_for_commit(df: pd.DataFrame, states=("GA", "TX"), last_n_months=24, max_rows=20000) -> pd.DataFrame:
     """
        Create a small, commit-safe subset for code review and CI.
@@ -179,6 +181,7 @@ def main(args) -> None:
     print(f"Reading: {csv_path}")
     df = pd.read_csv(csv_path, low_memory=False)
     long = melt_zori_wide_to_long(df)
+    print(long)
 
     # Create small subset safe to commit
     small = small_subset_for_commit(long, states=tuple(args.states), last_n_months=args.last_n_months)
