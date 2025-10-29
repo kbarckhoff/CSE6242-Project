@@ -1,5 +1,48 @@
-data_raw/
-data_clean/
-.ipynb_checkpoints/
+# -----------------
+# Python / Jupyter
+# -----------------
 __pycache__/
-venv/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# -----------------
+# Environments & IDEs
+# -----------------
+.venv/
+venv/          # covers cases where someone names it without the dot
+.env
+.env.*
+.idea/
+.vscode/
+
+# -----------------
+# Project data policy
+# -----------------
+# Keep raw + processed data OUT of git
+data/raw/*
+data/processed/*
+
+# Keep tiny samples IN git
+!data/samples/*
+
+# Allow placeholders so git tracks empty dirs
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# -----------------
+# Large/archival files
+# -----------------
+*.parquet
+*.feather
+*.zip
+*.7z
+*.gz
+*.tar
+*.csv.gz
+
+# -----------------
+# OS junk
+# -----------------
+.DS_Store
+Thumbs.db
