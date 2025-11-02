@@ -1,112 +1,136 @@
-# TODO: This file reads the raw data [Zillow's wide format which has one column per month] and crates
-#  a parquet file [a long format which one row per month]
+#!/usr/bin/env python
+"""
+Create a tidy parquet from Zillow's wide ZIP CSV.
 
+Input (wide):
+    RegionID, SizeRank, RegionName, RegionType, StateName, State, City, Metro, CountyName,
+    2015-01-31, 2015-02-28, ... <many monthly date columns>
+
+Output (long parquet):
+    zip (str, zero-padded 5)
+    state (str)
+    date (datetime64[ns], normalized to month-start "MS")
+    zori_smoothed_seasonal (float)
+
+Usage (examples):
+    python scripts/make_smoothed_seasonal.py \
+      --csv "data/raw/zori_all_homes_smoothed_seasonal_zip.csv" \
+      --out "data/processed/zori_smoothed_seasonal.parquet"
+
+    # restrict to GA and TX only (optional)
+    python scripts/make_smoothed_seasonal.py \
+      --csv "data/raw/zori_all_homes_smoothed_seasonal_zip.csv" \
+      --out "data/processed/zori_smoothed_seasonal.parquet" \
+      --subset-states GA TX
+"""
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-import pandas as pd
 import re
+from pathlib import Path
 
-RAW = Path("data/raw")
-PROCESSED = Path("data/processed")
+import numpy as np
+import pandas as pd
 
-def is_date_label(s: str) -> bool:
-    """
-    Treat a column name as a date if pandas can parse it,
-    e.g., '1/31/2015', '2015-01-31', 'Jan-2015', etc.
-    """
-    try:
-        pd.to_datetime(s)
-        return True
-    except Exception:
-        return False
 
-def melt_wide_to_long(df: pd.DataFrame,
-                      value_name: str = "zori_smoothed_seasonal") -> pd.DataFrame:
-    """
-    Convert Zillow wide format (one column per month) into long format:
-      columns: date, zip, state, <value_name>
-    ZIPs live in 'RegionName' and state code in 'State' if present.
-    """
-    # Identify ID columns and date columns
-    id_candidates = ["RegionID", "RegionName", "RegionType", "StateName",
-                     "State", "City", "Metro", "CountyName"]
-    id_cols = [c for c in id_candidates if c in df.columns]
-    date_cols = [c for c in df.columns if c not in id_cols and is_date_label(c)]
-
-    if not date_cols:
-        raise ValueError("Could not find any date columns in the CSV header.")
-
-    long = pd.melt(
-        df,
-        id_vars=id_cols,
-        value_vars=date_cols,
-        var_name="date",
-        value_name=value_name,
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Build tidy parquet from Zillow wide ZIP CSV")
+    p.add_argument("--csv", required=True, type=Path, help="Path to Zillow wide ZIP CSV")
+    p.add_argument("--out", required=True, type=Path, help="Output parquet path")
+    p.add_argument(
+        "--subset-states",
+        nargs="*",
+        default=None,
+        help="Optional list of 2-letter state codes to keep (e.g., GA TX)",
     )
+    p.add_argument(
+        "--value-name",
+        default="zori_smoothed_seasonal",
+        help="Name of the value column in the long output (default: zori_smoothed_seasonal)",
+    )
+    return p.parse_args()
 
-    # TODO: Parse fields
-    long["date"] = pd.to_datetime(long["date"], errors="coerce")  # change from string to datetime
-    long[value_name] = pd.to_numeric(long[value_name], errors="coerce")  # change from string to number
-
-    # TODO: Standardize keys: zip, state
-    if "RegionName" in long.columns:
-        # Keep only clean 5-digit ZIPs
-        z = long["RegionName"].astype(str).str.extract(r"(\d{5})", expand=False)
-        long["zip"] = z
-    elif "zip" not in long.columns:
-        long["zip"] = pd.NA
-
-    if "State" in long.columns:
-        long["state"] = long["State"].astype(str).str.upper()
-    elif "state" not in long.columns:
-        long["state"] = pd.NA
-
-    # TODO: Drop Null values
-    long = long.dropna(subset=["date", value_name, "zip"])
-    long = long[long["zip"].str.fullmatch(r"\d{5}")]
-
-    # TODO: Optional filtering based on date, zip and state
-    keep = ["date", "zip", "state", value_name]
-    keep = [c for c in keep if c in long.columns]
-    long = long[keep].sort_values(["zip", "date"]).reset_index(drop=True)
-
-    return long
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Convert Zillow smoothed seasonality CSV (wide) to long Parquet."
+    args = parse_args()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read minimally but safely: keep RegionType to filter ZIP rows; RegionName is the ZIP.
+    # Force RegionName and State to string to avoid dtype surprises.
+    print(f">> reading CSV: {args.csv}")
+    df = pd.read_csv(
+        args.csv,
+        dtype={"RegionName": "string", "State": "string", "RegionType": "string"},
+        low_memory=False,
     )
-    p.add_argument("--csv", required=True,
-                   help="Path to the Zillow smoothed seasonality CSV (zip granularity).")
-    p.add_argument("--out", default=str(PROCESSED / "zori_smoothed_seasonal.parquet"),
-                   help="Output Parquet path.")
-    p.add_argument("--subset-states", nargs="*", default=None,
-                   help="Optional list of state codes to keep (e.g., GA TX CA).")
-    args = p.parse_args()
 
-    RAW.mkdir(parents=True, exist_ok=True)
-    PROCESSED.mkdir(parents=True, exist_ok=True)
+    # Keep only ZIP rows
+    if "RegionType" in df.columns:
+        df = df.loc[df["RegionType"].str.lower() == "zip"].copy()
+    else:
+        print("!! RegionType column missing; assuming all rows are ZIPs")
 
-    csv_path = Path(args.csv)
-    out_path = Path(args.out)
-
-    print(f"Reading CSV -> {csv_path}")
-    df = pd.read_csv(csv_path, low_memory=False)
-
-    long = melt_wide_to_long(df)
-
+    # Optional state filtering
     if args.subset_states:
-        keep = {s.upper() for s in args.subset_states}
-        long = long[long["state"].isin(keep)]
-        print(f"Filtered to states: {sorted(keep)}; rows={len(long):,}")
+        keep = {s.strip().upper() for s in args.subset_states}
+        if "State" in df.columns:
+            before = len(df)
+            df = df.loc[df["State"].str.upper().isin(keep)].copy()
+            print(f">> subset states {sorted(keep)}: kept {len(df):,} of {before:,} rows")
+        else:
+            print("!! State column not found; cannot subset by state")
 
-    print(f"Writing Parquet -> {out_path}")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    long.to_parquet(out_path, index=False)
+    # Identify date columns (YYYY-MM-DD)
+    date_cols = [c for c in df.columns if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(c))]
+    if not date_cols:
+        raise ValueError("No YYYY-MM-DD date columns found in CSV")
 
-    print("Done.")
+    id_vars = []
+    # 'RegionName' holds the ZIP code; keep State for convenience
+    for c in ["RegionName", "State"]:
+        if c in df.columns:
+            id_vars.append(c)
+
+    # Melt wide → long
+    print(">> melting wide date columns to long…")
+    long = df.melt(
+        id_vars=id_vars,
+        value_vars=date_cols,
+        var_name="date",
+        value_name=args.value_name,
+    )
+
+    # Rename and clean
+    long = long.rename(columns={"RegionName": "zip", "State": "state"})
+
+    # Ensure ZIP is 5-char string with leading zeros if needed
+    long["zip"] = long["zip"].astype("string").str.zfill(5)
+
+    # Parse and normalize date to month start
+    long["date"] = pd.to_datetime(long["date"], errors="coerce")
+    long = long.dropna(subset=["date"])
+
+    long["date"] = long["date"].dt.to_period("M").dt.to_timestamp(how="start")
+
+    # Coerce values to float and drop NA rows
+    long[args.value_name] = pd.to_numeric(long[args.value_name], errors="coerce")
+    long = long.dropna(subset=[args.value_name])
+
+    # Keep only needed columns, sorted for nice parquet layout
+    keep_cols = ["zip", "state", "date", args.value_name]
+    long = long[keep_cols].sort_values(["zip", "date"]).reset_index(drop=True)
+
+    # Write parquet
+    print(
+        f">> writing parquet: {args.out}  "
+        f"(rows={len(long):,}, zips={long['zip'].nunique():,}, months≈{long['date'].nunique():,})"
+    )
+    long.to_parquet(args.out, index=False)
+
+    # A tiny preview
+    print(">> sample:")
+    print(long.head(5).to_string(index=False))
+
 
 if __name__ == "__main__":
     main()

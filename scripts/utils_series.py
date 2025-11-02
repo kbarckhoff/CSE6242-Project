@@ -1,5 +1,5 @@
 # TODO: Create a library file that contains the functions used by the
-#  time_series.py, make_forecasts.py, and volatility_index.py
+#  make_time_series.py, make_forecasts.py, and volatility_index.py
 
 # scripts/utils_series.py
 from __future__ import annotations
