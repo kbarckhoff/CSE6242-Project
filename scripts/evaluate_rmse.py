@@ -1,108 +1,85 @@
-import argparse
-from pathlib import Path
+from __future__ import annotations
+import argparse, random, warnings, pathlib
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-# ---------- helpers ----------
+warnings.filterwarnings("ignore")
 
-def _coerce_monthly(y: pd.Series) -> pd.Series:
-    """Ensure float values, month-start DateTimeIndex, no NaNs, MS freq."""
-    if y.empty:
-        return y
-    idx = pd.to_datetime(y.index)
-    y = pd.Series(pd.to_numeric(y.values, errors="coerce"), index=idx).dropna()
-    if y.empty:
-        return y
-    # normalize to month start and set monthly-start frequency
+def coerce_monthly(y: pd.Series) -> pd.Series:
+    """Numeric, monthly-start index, no gaps (MS freq)."""
+    y = pd.Series(pd.to_numeric(y.values, errors="coerce"),
+                  index=pd.to_datetime(y.index)).dropna()
     y.index = y.index.to_period("M").to_timestamp(how="start")
     y = y.asfreq("MS")
     return y
 
-def _fit_forecast(y_train: pd.Series, steps: int) -> pd.Series:
-    """Fit the SARIMAX and forecast `steps` ahead."""
-    model = SARIMAX(
-        y_train,
-        order=(1, 1, 1),
-        seasonal_order=(1, 1, 1, 12),
-        enforce_stationarity=True,
-        enforce_invertibility=True,
-        simple_differencing=False,
-    )
-    res = model.fit(disp=False)
-    pred = res.get_forecast(steps=steps)
-    mean = pred.predicted_mean.astype(float)
-    return mean
-
-def _metrics(y_true: pd.Series, y_pred: pd.Series) -> dict:
-    y_true, y_pred = y_true.align(y_pred, join="inner")
-    err = y_pred - y_true
-    rmse = float(np.sqrt(np.mean(np.square(err))))
-    mae  = float(np.mean(np.abs(err)))
-    # prevent dividing by zero for MAPE
-    denom = np.where(y_true.values == 0, np.nan, np.abs(y_true.values))
-    mape = float(np.nanmean(np.abs(err.values) / denom) * 100.0)
-    return {"rmse": rmse, "mae": mae, "mape": mape}
-
-# ---------- main ----------
+def rmse(a, b) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return float(np.sqrt(np.mean((a - b)**2)))
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--parquet", required=True, help="Path to zori_smoothed_seasonal.parquet")
-    p.add_argument("--geo-type", choices=["zip", "state"], default="zip")
-    p.add_argument("--geos", nargs="+", required=True, help="List of geos to evaluate (e.g., 30309 30305)")
-    p.add_argument("--value-col", default="zori_smoothed_seasonal", help="Value column in parquet")
-    p.add_argument("--horizon", type=int, default=9, help="Hold-out months and forecast horizon")
-    p.add_argument("--out-dir", type=Path, default=Path("data/processed/metrics"))
+    p.add_argument("--parquet", type=pathlib.Path,
+                   default=pathlib.Path("data/processed/zori_smoothed_seasonal.parquet"))
+    p.add_argument("--out", type=pathlib.Path,
+                   default=pathlib.Path("data/processed/metrics/rmse_sarimax_sample100.csv"))
+    p.add_argument("--n", type=int, default=100, help="number of ZIPs to sample")
+    p.add_argument("--h", type=int, default=12, help="forecast horizon for backtest")
+    p.add_argument("--seed", type=int, default=13)
     args = p.parse_args()
 
-    df = pd.read_parquet(args.parquet)
-    # Expecting columns: ['zip','state','date', value_col]
+    df = pd.read_parquet(args.parquet)  # expects: ['zip','state','date','zori_smoothed_seasonal']
+    df = df.rename(columns={"zori_smoothed_seasonal": "rent"})
     df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["zip", "date"])
 
-    out_rows = []
-    for g in args.geos:
-        # filter
-        sub = df.loc[df[args.geo_type].astype(str) == str(g), ["date", args.value_col]].sort_values("date")
-        if sub.empty:
-            print(f"[skip] {g}: no data")
+    # Only ZIPs with enough history (>= 36 months)
+    eligible = (df.groupby("zip")["date"].nunique() >= 36)
+    zips_all = sorted(eligible[eligible].index.tolist())
+    if not zips_all:
+        raise SystemExit("No ZIPs with >=36 months of history in parquet.")
+
+    random.seed(args.seed)
+    sample = random.sample(zips_all, k=min(args.n, len(zips_all)))
+
+    rows, fails = [], []
+    for i, z in enumerate(sample, 1):
+        sub = df.loc[df["zip"] == z, ["date", "rent"]].set_index("date").sort_index()
+        y = coerce_monthly(sub["rent"])
+        if len(y) < args.h + 12:
+            # too short for a 12-mo backtest — skip without error
             continue
 
-        y = pd.Series(sub[args.value_col].values, index=sub["date"].values, name="zori").astype(float)
-        y = _coerce_monthly(y)
+        train, test = y.iloc[:-args.h], y.iloc[-args.h:]
 
-        if y.size < args.horizon + 24:  # need some history to fit; tweak if needed
-            print(f"[skip] {g}: not enough history ({y.size} pts)")
-            continue
+        try:
+            model = SARIMAX(
+                train,
+                order=(1, 1, 1),
+                seasonal_order=(1, 1, 1, 12),
+                enforce_stationarity=True,
+                enforce_invertibility=True,
+                simple_differencing=False,
+            )
+            fit = model.fit(disp=False)
+            fc = fit.get_forecast(steps=args.h).predicted_mean
+            score = rmse(test.values, fc.values)
+            rows.append({"ZipCode": str(z).zfill(5), "RMSE_SARIMAX": score})
+        except Exception as e:
+            fails.append((z, repr(e)))
 
-        # hold-out last H months for evaluation
-        H = args.horizon
-        y_train = y.iloc[:-H]
-        y_test  = y.iloc[-H:]
+        if i % 10 == 0:
+            print(f"[{i}/{len(sample)}] processed...")
 
-        y_pred = _fit_forecast(y_train, steps=H)
-        # create a proper forecast index matching the test set
-        future_idx = pd.date_range(y_train.index[-1] + pd.offsets.MonthBegin(1), periods=H, freq="MS")
-        y_pred.index = future_idx
+    out = pd.DataFrame(rows).sort_values("ZipCode").reset_index(drop=True)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.out, index=False)
 
-        m = _metrics(y_test, y_pred)
-        row = {
-            "geo_type": args.geo_type,
-            "geo": g,
-            "n_train": int(y_train.size),
-            "n_test": int(y_test.size),
-            "horizon": H,
-            **m,
-        }
-        out_rows.append(row)
-
-        print(f"{args.geo_type}={g}: RMSE={m['rmse']:.2f}, MAE={m['mae']:.2f}, MAPE={m['mape']:.2f}%")
-
-    if out_rows:
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = args.out_dir / f"metrics_{args.geo_type}.csv"
-        pd.DataFrame(out_rows).to_csv(out_path, index=False)
-        print(f"→ wrote {out_path.resolve()}")
+    print(f"Wrote {args.out}  rows={len(out)}  (attempted={len(sample)}, fails={len(fails)})")
+    if len(out):
+        print(f"Mean RMSE (SARIMAX): {out['RMSE_SARIMAX'].mean():.2f}")
 
 if __name__ == "__main__":
     main()

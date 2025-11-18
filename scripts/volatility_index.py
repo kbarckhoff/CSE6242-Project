@@ -9,7 +9,6 @@ VALUE_COL = "zori_smoothed_seasonal"  # column in parquet
 
 # ---------- helpers ----------
 def _coerce_monthly(y: pd.Series) -> pd.Series:
-    """Ensure numeric values, month-start DatetimeIndex, and MS freq."""
     if y.empty:
         return y
     y = pd.Series(pd.to_numeric(y.values, errors="coerce"),

@@ -17,11 +17,7 @@ Usage (examples):
       --csv "data/raw/zori_all_homes_smoothed_seasonal_zip.csv" \
       --out "data/processed/zori_smoothed_seasonal.parquet"
 
-    # restrict to GA and TX only (optional)
-    python scripts/make_smoothed_seasonal.py \
-      --csv "data/raw/zori_all_homes_smoothed_seasonal_zip.csv" \
-      --out "data/processed/zori_smoothed_seasonal.parquet" \
-      --subset-states GA TX
+
 """
 from __future__ import annotations
 
@@ -55,8 +51,7 @@ def main():
     args = parse_args()
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Read minimally but safely: keep RegionType to filter ZIP rows; RegionName is the ZIP.
-    # Force RegionName and State to string to avoid dtype surprises.
+    # Force RegionName and State to string
     print(f">> reading CSV: {args.csv}")
     df = pd.read_csv(
         args.csv,

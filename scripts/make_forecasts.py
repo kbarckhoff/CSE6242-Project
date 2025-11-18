@@ -1,4 +1,6 @@
+
 from __future__ import annotations
+
 from pathlib import Path
 import argparse
 import numpy as np
@@ -6,66 +8,66 @@ import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import matplotlib.pyplot as plt
 
-# utils in your repo
+# local utils
 from utils_series import list_geos, monthly_series_for_geo
 
 
-# ---------- helpers ----------
+# ---------------- helpers ----------------
 
 def _coerce_monthly(y: pd.Series) -> pd.Series:
     """
-    Ensure y is numeric, has a DatetimeIndex at month-start (MS), and no NaNs.
+    Ensure y is numeric, monthly-start indexed (MS), sorted, and has no NaNs.
+    Returns an empty Series (len 0) if nothing usable remains.
     """
-    # numeric values with a real datetime index
-    y = pd.Series(pd.to_numeric(y.values, errors="coerce"),
-                  index=pd.to_datetime(y.index)).dropna()
+    if y is None or len(y) == 0:
+        return pd.Series(dtype=float)
+
+    y = pd.Series(
+        pd.to_numeric(y.values, errors="coerce"),
+        index=pd.to_datetime(y.index),
+        dtype="float64",
+    ).dropna()
 
     if y.empty:
         return y
 
-    # normalize index to the first day of each month
-    # (no 'MS' freq here; that's what caused the error)
+    # Month-start normalized index, sorted
+    y = y.sort_index()
     y.index = y.index.to_period("M").to_timestamp(how="start")
-
-    # and declare the freq as monthly-start
     y = y.asfreq("MS")
     return y
 
 
 def _future_index_from_last(y: pd.Series, steps: int) -> pd.DatetimeIndex:
-    """
-    Build a monthly-start future index beginning the month after the last observed.
-    """
     last = y.index[-1]
     return pd.date_range(last + pd.offsets.MonthBegin(1), periods=steps, freq="MS")
 
 
-def sarimax_forecast(y: pd.Series, steps: int = 9) -> tuple[pd.Series, pd.DataFrame]:
+def sarimax_forecast(y: pd.Series, steps: int = 12) -> tuple[pd.Series, pd.DataFrame]:
     """
-    Forecast with a conservative SARIMAX. If CI comes back non-finite, fall back to residual sigma.
-    If too little data, use a persistence baseline with sigma from recent deltas.
-    Returns:
-        mean (pd.Series), ci (pd.DataFrame with ['ci95_lo','ci95_hi'])
+    Conservative SARIMAX -> (mean, ci). Falls back to a persistence baseline
+    if the SARIMAX fit or its CI become non-finite.
     """
     y = _coerce_monthly(y)
     n = len(y.dropna())
 
-    # if there isn't enough data, use a simple baseline
+    # --- Short series fallback ---
     if n < 18:
-        # repeat last value; CI from recent month-to-month deltas
-        mean = pd.Series([y.iloc[-1]] * steps, index=_future_index_from_last(y, steps))
+        future_idx = _future_index_from_last(y, steps)
+        mean = pd.Series(y.iloc[-1], index=future_idx, dtype=float)
+
         deltas = y.diff().dropna()
-        if len(deltas) >= 6:
-            sigma = float(np.nanstd(deltas[-12:]))  # use up to last 12 deltas
-        else:
-            sigma = float(np.nanstd(deltas)) if len(deltas) else 0.0
+        sigma = float(np.nanstd(deltas.iloc[-12:])) if len(deltas) else 0.0
         ci = pd.DataFrame(
-            {"ci95_lo": mean - 1.96 * sigma, "ci95_hi": mean + 1.96 * sigma},
+            {
+                "ci95_lo": mean - 1.96 * sigma,
+                "ci95_hi": mean + 1.96 * sigma,
+            },
             index=mean.index,
         )
         return mean.astype(float), ci.astype(float)
 
-    # SARIMAX model (better than ARIMA for short term forecasts)
+    # --- SARIMAX model ---
     model = SARIMAX(
         y,
         order=(1, 1, 1),
@@ -76,20 +78,22 @@ def sarimax_forecast(y: pd.Series, steps: int = 9) -> tuple[pd.Series, pd.DataFr
     )
     res = model.fit(disp=False)
 
-    # Forecast
     pred = res.get_forecast(steps=steps)
     mean = pred.predicted_mean.astype(float)
     ci = pred.conf_int(alpha=0.05).copy()
 
-    # Normalize CI column names
+    # Normalize CI names
     if ci.shape[1] == 2:
         ci.columns = ["ci95_lo", "ci95_hi"]
 
-    # Fallback if any non-finite slips in
+    # Fallback if CI has any non-finite values
     if not np.isfinite(ci.values).all():
         sigma = float(np.nanstd(res.resid, ddof=1))
         ci = pd.DataFrame(
-            {"ci95_lo": mean - 1.96 * sigma, "ci95_hi": mean + 1.96 * sigma},
+            {
+                "ci95_lo": mean - 1.96 * sigma,
+                "ci95_hi": mean + 1.96 * sigma,
+            },
             index=mean.index,
         )
 
@@ -105,9 +109,8 @@ def export_and_plot(
     out_png: Path | None,
 ) -> None:
     """
-    Write CSV and plot the forecast.
+    Write CSV and optionally save a forecast plot.
     """
-    # Future index aligned to monthly start
     future_idx = _future_index_from_last(y, len(mean))
     mean = mean.reindex(future_idx)
     ci = ci.reindex(future_idx)
@@ -134,12 +137,13 @@ def export_and_plot(
         ax.set_ylabel("ZORI (index)")
         ax.legend(loc="upper left")
         fig.tight_layout()
+
         out_png.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_png, dpi=160)
         plt.close(fig)
 
 
-# ---------- CLI ----------
+# ---------------- CLI ----------------
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -158,22 +162,40 @@ def main() -> None:
     if (not geos) or (len(geos) == 1 and (geos[0] or "").upper() == "ALL"):
         geos = list_geos(args.parquet, args.geo_type)
 
+    total = len(geos)
+    made = 0
+    skipped = 0
+    failed = 0
+
     for g in geos:
-        # Pull a clean monthly series for this geo
-        y = monthly_series_for_geo(args.parquet, args.geo_type, g, args.value_col)
-        y = _coerce_monthly(y)
-        if y.empty:
-            print(f"[skip] {g}: no data")
+        try:
+            # Pull a clean monthly series for this geo
+            y = monthly_series_for_geo(args.parquet, args.geo_type, g, args.value_col)
+            y = _coerce_monthly(y)
+
+            # Skip if no usable data
+            if y.empty or y.dropna().shape[0] < 2:
+                print(f"[skip] {g}: no data")
+                skipped += 1
+                continue
+
+            # Forecast
+            mean, ci = sarimax_forecast(y, steps=args.steps)
+
+            # Outputs
+            out_csv = args.out_dir / f"{args.geo_type}-{g}" / "forecast.csv"
+            out_png = None if args.no_figures else (args.fig_dir / f"forecast_{g}.png")
+
+            export_and_plot(state=g, y=y, mean=mean, ci=ci, out_csv=out_csv, out_png=out_png)
+            print(f"[ok] wrote {out_csv} {'(no figure)' if out_png is None else f'& {out_png}'}")
+            made += 1
+
+        except Exception as e:
+            print(f"[err] {g}: {type(e).__name__}: {e}")
+            failed += 1
             continue
 
-        mean, ci = sarimax_forecast(y, steps=args.steps)
-
-        out_csv = args.out_dir / f"{args.geo_type}={g}" / "forecast.csv"
-        out_png = None if args.no_figures else (args.fig_dir / f"forecast_{g}.png")
-
-        export_and_plot(state=g, y=y, mean=mean, ci=ci, out_csv=out_csv, out_png=out_png)
-
-        print(f"[ok] wrote {out_csv} {'(no figure)' if out_png is None else f'& {out_png}'}")
+    print(f"\nSummary: total={total}, made={made}, skipped(no data)={skipped}, failed={failed}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 # TODO: Create a library file that contains the functions used by the
 #  make_time_series.py, make_forecasts.py, and volatility_index.py
 
-# scripts/utils_series.py
 from __future__ import annotations
 from pathlib import Path
 import os
@@ -15,7 +14,6 @@ def scan_parquet_anywhere(path: str | Path) -> pl.LazyFrame:
     Works with a single parquet file or a directory of partitioned parquet.
     """
     path = str(path)
-    # If this fails to find the path, we can mount GCS (gcsfuse) or use pandas+gcsfs fallback.
     return pl.scan_parquet(path)
 
 def to_pandas_if_small(df: pl.DataFrame) -> pd.DataFrame:
@@ -36,35 +34,35 @@ def monthly_series_for_geo(source: str | Path | pd.DataFrame,
                            geo: str,
                            value_col: str) -> pd.Series:
     """
-    Return a monthly pd.Series for a single geo, reading from a parquet PATH
-    or from an already-loaded DataFrame.
+    Return a clean monthly pd.Series for a single geo (zip/state/metro).
+    Handles duplicate rows per month (e.g., state-level) by aggregating.
     """
-    # Load if a path is passed
+    # 1) Load
     if isinstance(source, (str, Path)):
         df = pd.read_parquet(source)
     else:
         df = source
 
-    # column name for the geo type
-    geo_col_map = {
-        "state": "state",
-        "zip": "zip",
-        "metro": "RegionName",
-    }
+    # 2) Which column holds the geo id?
+    geo_col_map = {"state": "state", "zip": "zip", "metro": "RegionName"}
     geo_col = geo_col_map.get(geo_type, geo_type)
 
-    # filter + sort + cast to a clean monthly series
+    # 3) Filter and keep only date + value
     sub = df.loc[df[geo_col] == geo, ["date", value_col]].copy()
-    sub["date"] = pd.to_datetime(sub["date"])
-    sub.sort_values("date", inplace=True)
 
-    s = sub.set_index("date")[value_col].astype("float64")
+    # 4) Normalize dates to **month start** and aggregate to ONE row per month
+    sub["date"] = (
+        pd.to_datetime(sub["date"])
+          .dt.to_period("M")
+          .dt.to_timestamp(how="start")     # <-- key fix (no "MS" here)
+    )
+    sub = sub.groupby("date", as_index=False)[value_col].mean()
 
-    # Ensure monthly data [per month inputs]
-    try:
-        s = s.asfreq("MS")  # month start; use "M" if your dates are month-end
-    except Exception:
-        pass
+    # 5) Build series and make it a regular monthly index
+    s = sub.set_index("date")[value_col].astype("float64").sort_index()
+    s = s.resample("MS").mean()  # monthly start index; safe if some months missing
 
     s.name = value_col
     return s
+
+
