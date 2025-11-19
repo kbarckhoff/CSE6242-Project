@@ -1,0 +1,13 @@
+-r requirements.txt
+
+# Notebooks / IDE helpers
+jupyterlab
+ipykernel
+
+# Visual Tools
+plotly
+scipy
+
+# dev tools
+black
+isort
